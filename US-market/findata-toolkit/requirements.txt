@@ -3,7 +3,6 @@
 
 # === Core Data Fetching ===
 yfinance>=0.2.31          # US stock data (no API key)
-pandas-datareader>=0.10.0 # FRED macro data (no API key)
 
 # === Data Processing ===
 pandas>=2.0.0

@@ -25,6 +25,7 @@ from common.config import get_config
 
 BASE_URL = "https://efts.sec.gov/LATEST"
 DATA_URL = "https://data.sec.gov"
+SEC_WWW = "https://www.sec.gov"
 EDGAR_FULL = "https://www.sec.gov/cgi-bin/browse-edgar"
 
 
@@ -49,7 +50,7 @@ def _rate_limited_get(url: str, params: dict | None = None) -> requests.Response
 
 def lookup_cik(ticker: str) -> dict:
     """Resolve a ticker to a CIK number using SEC company tickers JSON."""
-    url = f"{DATA_URL}/files/company_tickers.json"
+    url = f"{SEC_WWW}/files/company_tickers.json"
     resp = _rate_limited_get(url)
     data = resp.json()
 
@@ -85,7 +86,7 @@ def fetch_insider_trades(ticker: str, days: int = 90) -> dict:
 
     # Step 2: Get recent filings via EDGAR full-text search
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-    url = f"{BASE_URL}/submissions/CIK{cik}.json"
+    url = f"{DATA_URL}/submissions/CIK{cik}.json"
 
     try:
         resp = _rate_limited_get(url)
@@ -121,9 +122,14 @@ def fetch_insider_trades(ticker: str, days: int = 90) -> dict:
     trades = []
     for filing in form4_filings[:20]:  # Limit to 20 most recent
         accession = filing["accession_number"].replace("-", "")
+        # primaryDocument often points to XSL-rendered version (e.g.
+        # xslF345X05/ownership.xml); strip the XSL prefix to get raw XML.
+        doc = filing["document"]
+        if "/" in doc:
+            doc = doc.split("/", 1)[1]
         xml_url = (
-            f"{DATA_URL}/Archives/edgar/data/{cik.lstrip('0')}/"
-            f"{accession}/{filing['document']}"
+            f"{SEC_WWW}/Archives/edgar/data/{cik.lstrip('0')}/"
+            f"{accession}/{doc}"
         )
 
         try:
@@ -166,6 +172,14 @@ def fetch_insider_trades(ticker: str, days: int = 90) -> dict:
     }
 
 
+def _find(element, tag: str, ns: str):
+    """Find a child element, trying with namespace prefix first, then without."""
+    el = element.find(f"{ns}{tag}")
+    if el is None and ns:
+        el = element.find(tag)
+    return el
+
+
 def _parse_form4_xml(xml_text: str, filing_date: str) -> list[dict]:
     """Parse Form 4 XML to extract transaction details."""
     import xml.etree.ElementTree as ET
@@ -177,94 +191,99 @@ def _parse_form4_xml(xml_text: str, filing_date: str) -> list[dict]:
     except ET.ParseError:
         return []
 
-    # Extract insider name
-    ns = ""  # namespace handling
+    # Detect namespace (most Form 4 XMLs have none)
+    ns = ""
     for prefix in [
         "{http://www.sec.gov/cgi-bin/viewer?action=view&cik=}",
         "",
     ]:
-        reporting = root.find(f"{prefix}reportingOwner")
-        if reporting is not None:
+        if root.find(f"{prefix}reportingOwner") is not None:
             ns = prefix
             break
 
+    # Extract insider name
     insider_name = ""
     insider_title = ""
+    reporting = _find(root, "reportingOwner", ns)
     if reporting is not None:
-        rid = reporting.find(f"{ns}reportingOwnerId")
+        rid = _find(reporting, "reportingOwnerId", ns)
         if rid is not None:
-            name_el = rid.find(f"{ns}rptOwnerName")
+            name_el = _find(rid, "rptOwnerName", ns)
             insider_name = name_el.text if name_el is not None else ""
 
-        rel = reporting.find(f"{ns}reportingOwnerRelationship")
+        rel = _find(reporting, "reportingOwnerRelationship", ns)
         if rel is not None:
-            for title_tag in [
-                "officerTitle", "isDirector", "isOfficer", "isTenPercentOwner"
-            ]:
-                el = rel.find(f"{ns}{title_tag}")
-                if el is not None and el.text:
-                    if title_tag == "officerTitle":
-                        insider_title = el.text
-                    elif el.text in ("1", "true"):
+            # Prefer officerTitle if present
+            title_el = _find(rel, "officerTitle", ns)
+            if title_el is not None and title_el.text:
+                insider_title = title_el.text
+            else:
+                for title_tag in ["isDirector", "isOfficer", "isTenPercentOwner"]:
+                    el = _find(rel, title_tag, ns)
+                    if el is not None and el.text in ("1", "true"):
                         insider_title = title_tag.replace("is", "")
+                        break
 
     # Extract non-derivative transactions
-    for tx_table in [
-        root.find(f"{ns}nonDerivativeTable"),
-        root.find("nonDerivativeTable"),
-    ]:
-        if tx_table is None:
+    tx_table = _find(root, "nonDerivativeTable", ns)
+    if tx_table is None:
+        return trades
+
+    for tx in tx_table:
+        tag = tx.tag.replace(ns, "") if ns else tx.tag
+        if "Transaction" not in tag:
             continue
-        for tx in tx_table:
-            tag = tx.tag.replace(ns, "")
-            if "Transaction" not in tag:
-                continue
 
-            coding = tx.find(f"{ns}transactionCoding") or tx.find("transactionCoding")
-            amounts = tx.find(f"{ns}transactionAmounts") or tx.find("transactionAmounts")
-            security = tx.find(f"{ns}securityTitle") or tx.find("securityTitle")
+        coding = _find(tx, "transactionCoding", ns)
+        tx_code = ""
+        if coding is not None:
+            code_el = _find(coding, "transactionCode", ns)
+            tx_code = code_el.text if code_el is not None else ""
 
-            tx_code = ""
-            if coding is not None:
-                code_el = coding.find(f"{ns}transactionCode") or coding.find("transactionCode")
-                tx_code = code_el.text if code_el is not None else ""
+        # P = Purchase, S = Sale, A = Grant/Award, M = Exercise
+        if tx_code not in ("P", "S"):
+            continue  # Only open-market purchases and sales
 
-            # P = Purchase, S = Sale, A = Grant/Award, M = Exercise
-            if tx_code not in ("P", "S"):
-                continue  # Only open-market purchases and sales
+        amounts = _find(tx, "transactionAmounts", ns)
+        shares = 0
+        price = 0
+        if amounts is not None:
+            shares_el = _find(amounts, "transactionShares", ns)
+            if shares_el is not None:
+                val = _find(shares_el, "value", ns)
+                if val is not None:
+                    shares = safe_float(val.text, 0)
+            price_el = _find(amounts, "transactionPricePerShare", ns)
+            if price_el is not None:
+                val = _find(price_el, "value", ns)
+                if val is not None:
+                    price = safe_float(val.text, 0)
 
-            shares = 0
-            price = 0
-            if amounts is not None:
-                shares_el = (
-                    amounts.find(f"{ns}transactionShares/{ns}value")
-                    or amounts.find("transactionShares/value")
-                )
-                price_el = (
-                    amounts.find(f"{ns}transactionPricePerShare/{ns}value")
-                    or amounts.find("transactionPricePerShare/value")
-                )
-                if shares_el is not None:
-                    shares = safe_float(shares_el.text, 0)
-                if price_el is not None:
-                    price = safe_float(price_el.text, 0)
+        security = _find(tx, "securityTitle", ns)
+        sec_title = ""
+        if security is not None:
+            val_el = _find(security, "value", ns)
+            sec_title = val_el.text if val_el is not None else ""
 
-            sec_title = ""
-            if security is not None:
-                val_el = security.find(f"{ns}value") or security.find("value")
-                sec_title = val_el.text if val_el is not None else ""
+        # Extract transaction date if available
+        tx_date = ""
+        date_el = _find(tx, "transactionDate", ns)
+        if date_el is not None:
+            val = _find(date_el, "value", ns)
+            tx_date = val.text if val is not None else ""
 
-            trades.append({
-                "filing_date": filing_date,
-                "insider_name": insider_name,
-                "insider_title": insider_title,
-                "transaction_type": "Purchase" if tx_code == "P" else "Sale",
-                "transaction_code": tx_code,
-                "security": sec_title,
-                "shares": shares,
-                "price_per_share": price,
-                "transaction_value": round(shares * price, 2) if shares and price else None,
-            })
+        trades.append({
+            "filing_date": filing_date,
+            "transaction_date": tx_date or filing_date,
+            "insider_name": insider_name,
+            "insider_title": insider_title,
+            "transaction_type": "Purchase" if tx_code == "P" else "Sale",
+            "transaction_code": tx_code,
+            "security": sec_title,
+            "shares": shares,
+            "price_per_share": price,
+            "transaction_value": round(shares * price, 2) if shares and price else None,
+        })
 
     return trades
 
@@ -281,7 +300,7 @@ def fetch_filings(ticker: str, form_type: str = "10-K",
         return cik_info
 
     cik = cik_info["cik"]
-    url = f"{BASE_URL}/submissions/CIK{cik}.json"
+    url = f"{DATA_URL}/submissions/CIK{cik}.json"
 
     try:
         resp = _rate_limited_get(url)

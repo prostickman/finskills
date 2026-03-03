@@ -24,22 +24,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common.utils import output_json, safe_float, error_exit
 
 
+FRED_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv"
+
+
 def _fetch_fred_series(series_id: str, start: str | None = None,
                         periods: int = 24) -> list[dict]:
-    """Fetch a FRED series. Returns list of {date, value} dicts."""
+    """Fetch a FRED series via CSV endpoint. Returns list of {date, value} dicts."""
+    import csv
+    import io
+    import requests
+
+    if start is None:
+        start = (datetime.now() - timedelta(days=periods * 31)).strftime("%Y-%m-%d")
     try:
-        import pandas_datareader.data as web
-        if start is None:
-            start = (datetime.now() - timedelta(days=periods * 31)).strftime("%Y-%m-%d")
-        df = web.DataReader(series_id, "fred", start=start)
+        resp = requests.get(FRED_CSV_URL, params={"id": series_id, "cosd": start}, timeout=30)
+        resp.raise_for_status()
+        reader = csv.DictReader(io.StringIO(resp.text))
         records = []
-        for dt, row in df.iterrows():
-            val = safe_float(row.iloc[0])
+        for row in reader:
+            val = safe_float(row.get(series_id, "").strip() or None)
             if val is not None:
-                records.append({
-                    "date": dt.strftime("%Y-%m-%d"),
-                    "value": val,
-                })
+                records.append({"date": row["observation_date"], "value": val})
         return records
     except Exception as e:
         return [{"error": str(e)}]
@@ -371,7 +376,7 @@ def main():
         output_json(data)
 
     except ImportError:
-        error_exit("pandas-datareader is required. Install: pip install pandas-datareader")
+        error_exit("requests is required. Install: pip install requests")
     except Exception as e:
         error_exit(f"Error: {e}")
 
