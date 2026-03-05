@@ -116,12 +116,32 @@ def safe_div(a, b, default=None):
 
 
 def safe_float(val, default=None):
-    """安全转换为 float，失败时返回 default。"""
-    if val is None:
+    """安全转换为 float，失败时返回 default。处理 %、亿、万 等后缀。
+
+    Note: '%' is stripped but the value is NOT divided by 100 — e.g. "15.3%"
+    returns 15.3.  Callers that need a fraction should divide by 100 themselves.
+    """
+    if val is None or val is False:  # AKShare may return False for missing data
         return default
+    import math
+    if isinstance(val, (int, float)):
+        if math.isnan(val) or math.isinf(val):
+            return default
+        return float(val)
     try:
-        import math
-        result = float(val)
+        s = str(val).strip()
+        if not s:
+            return default
+        multiplier = 1.0
+        if s.endswith('%'):
+            s = s[:-1]
+        elif s.endswith('亿'):
+            s = s[:-1]
+            multiplier = 1e8
+        elif s.endswith('万'):
+            s = s[:-1]
+            multiplier = 1e4
+        result = float(s) * multiplier
         if math.isnan(result) or math.isinf(result):
             return default
         return result

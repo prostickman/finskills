@@ -114,12 +114,14 @@ def fetch_inflation() -> dict:
     try:
         df = ak.macro_china_cpi_monthly()
         if df is not None and not df.empty:
+            # Columns: ['商品', '日期', '今值', '预测值', '前值']
+            # Chronological order (oldest first), so .tail(12) is correct
             recent = df.tail(12)
             records = []
             for _, row in recent.iterrows():
                 records.append({
-                    "date": str(row.iloc[0]),
-                    "cpi_yoy": safe_float(row.iloc[1]) if len(row) > 1 else None,
+                    "date": str(row.iloc[1]),
+                    "cpi_yoy": safe_float(row.iloc[2]) if len(row) > 2 else None,
                 })
             result["cpi"] = {
                 "latest": records[-1]["cpi_yoy"] if records else None,
@@ -131,14 +133,16 @@ def fetch_inflation() -> dict:
 
     # PPI
     try:
-        df = ak.macro_china_ppi_monthly()
+        df = ak.macro_china_ppi()
         if df is not None and not df.empty:
-            recent = df.tail(12)
+            # Columns: ['月份', '当月', '当月同比增长', '累计']
+            # Reverse chronological order (newest first)
+            recent = df.head(12).iloc[::-1]  # take newest 12, reverse to ascending
             records = []
             for _, row in recent.iterrows():
                 records.append({
                     "date": str(row.iloc[0]),
-                    "ppi_yoy": safe_float(row.iloc[1]) if len(row) > 1 else None,
+                    "ppi_yoy": safe_float(row.iloc[2]) if len(row) > 2 else None,
                 })
             result["ppi"] = {
                 "latest": records[-1]["ppi_yoy"] if records else None,
@@ -164,13 +168,14 @@ def fetch_pmi() -> dict:
     try:
         df = ak.macro_china_pmi()
         if df is not None and not df.empty:
-            recent = df.tail(12)
+            # macro_china_pmi() returns reverse chronological order (newest first)
+            recent = df.head(12).iloc[::-1]  # take newest 12, reverse to ascending
             records = []
             for _, row in recent.iterrows():
                 records.append({
                     "date": str(row.iloc[0]),
                     "manufacturing_pmi": safe_float(row.iloc[1]) if len(row) > 1 else None,
-                    "non_manufacturing_pmi": safe_float(row.iloc[2]) if len(row) > 2 else None,
+                    "non_manufacturing_pmi": safe_float(row.iloc[3]) if len(row) > 3 else None,
                 })
             mfg_values = [e["manufacturing_pmi"] for e in records]
             result["manufacturing_pmi"] = {
@@ -221,14 +226,16 @@ def fetch_social_financing() -> dict:
 
     # Money supply M2
     try:
-        df = ak.macro_china_m2_monthly()
+        df = ak.macro_china_money_supply()
         if df is not None and not df.empty:
-            recent = df.tail(12)
+            # Columns: ['月份', '货币和准货币(M2)-数量(亿元)', '货币和准货币(M2)-同比增长', ...]
+            # Reverse chronological order (newest first)
+            recent = df.head(12).iloc[::-1]  # take newest 12, reverse to ascending
             records = []
             for _, row in recent.iterrows():
                 records.append({
                     "date": str(row.iloc[0]),
-                    "m2_yoy": safe_float(row.iloc[1]) if len(row) > 1 else None,
+                    "m2_yoy": safe_float(row.iloc[2]) if len(row) > 2 else None,
                 })
             result["m2_growth"] = {
                 "latest": records[-1]["m2_yoy"] if records else None,

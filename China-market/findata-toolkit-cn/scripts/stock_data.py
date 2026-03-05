@@ -63,8 +63,6 @@ def fetch_basic_info(symbols: list[str]) -> list[dict]:
                 "industry": info.get("行业", ""),
                 "market_cap": safe_float(info.get("总市值")),
                 "circulating_cap": safe_float(info.get("流通市值")),
-                "pe_ttm": safe_float(info.get("市盈率(动态)")),
-                "pb": safe_float(info.get("市净率")),
                 "total_shares": safe_float(info.get("总股本")),
                 "circulating_shares": safe_float(info.get("流通股")),
                 "exchange": _get_exchange_suffix(sym),
@@ -117,7 +115,6 @@ def fetch_financial_metrics(symbol: str) -> dict:
                 result["valuation"] = {
                     "pe_ttm": safe_float(row.get("市盈率-动态")),
                     "pb": safe_float(row.get("市净率")),
-                    "ps_ttm": safe_float(row.get("市销率")),
                     "total_market_cap": safe_float(row.get("总市值")),
                     "circulating_cap": safe_float(row.get("流通市值")),
                 }
@@ -127,8 +124,6 @@ def fetch_financial_metrics(symbol: str) -> dict:
                     "volume": safe_float(row.get("成交量")),
                     "amount": safe_float(row.get("成交额")),
                     "amplitude": safe_float(row.get("振幅")),
-                    "high_52w": safe_float(row.get("52周最高")),
-                    "low_52w": safe_float(row.get("52周最低")),
                 }
     except Exception:
         pass
@@ -137,12 +132,11 @@ def fetch_financial_metrics(symbol: str) -> dict:
     try:
         df_fin = ak.stock_financial_abstract_ths(symbol=sym, indicator="按报告期")
         if df_fin is not None and not df_fin.empty:
-            latest = df_fin.iloc[0]
+            latest = df_fin.iloc[-1]
             result["profitability"] = {
                 "roe": safe_float(latest.get("净资产收益率")),
                 "gross_margin": safe_float(latest.get("销售毛利率")),
                 "net_margin": safe_float(latest.get("销售净利率")),
-                "roa": safe_float(latest.get("总资产报酬率")),
             }
             result["leverage"] = {
                 "debt_to_asset_ratio": safe_float(latest.get("资产负债率")),
@@ -151,7 +145,7 @@ def fetch_financial_metrics(symbol: str) -> dict:
             }
             result["growth"] = {
                 "revenue_growth_yoy": safe_float(latest.get("营业总收入同比增长率")),
-                "profit_growth_yoy": safe_float(latest.get("归母净利润同比增长率")),
+                "profit_growth_yoy": safe_float(latest.get("净利润同比增长率")),
             }
             result["per_share"] = {
                 "eps": safe_float(latest.get("基本每股收益")),
@@ -169,8 +163,8 @@ def fetch_financial_metrics(symbol: str) -> dict:
             dividends = []
             for _, row in recent_divs.iterrows():
                 dividends.append({
-                    "report_date": str(row.get("报告期", "")),
-                    "dividend_per_share": safe_float(row.get("每股分红")),
+                    "report_date": str(row.get("公告日期", "")),
+                    "dividend_per_share": safe_float(row.get("派息")),
                     "ex_date": str(row.get("除权除息日", "")),
                 })
             result["dividends"] = dividends
@@ -294,31 +288,58 @@ def fetch_financial_statements(symbol: str) -> dict:
     return result
 
 
+def _get_exchange_prefix(symbol: str) -> str:
+    """Return exchange prefix for insider trade filtering (e.g. 'SH688557')."""
+    sym = _normalize_symbol(symbol)
+    if sym.startswith("6"):
+        return "SH" + sym
+    elif sym.startswith(("0", "3")):
+        return "SZ" + sym
+    elif sym.startswith(("4", "8")):
+        return "BJ" + sym
+    return "SH" + sym
+
+
 def fetch_insider_trades(symbol: str) -> dict:
     """Fetch insider trading (董监高增减持) data for an A-share stock."""
     import akshare as ak
 
     sym = _normalize_symbol(symbol)
+    prefixed = _get_exchange_prefix(sym)
 
     try:
-        df = ak.stock_inner_trade_xq(symbol=sym)
+        df = ak.stock_inner_trade_xq()
         if df is None or df.empty:
+            return {"symbol": sym, "transactions": [], "note": "No insider trades found"}
+
+        # Filter for our target symbol
+        df = df[df["股票代码"] == prefixed]
+        if df.empty:
             return {"symbol": sym, "transactions": [], "note": "No insider trades found"}
 
         trades = []
         for _, row in df.iterrows():
+            shares_changed = safe_float(row.get("变动股数"))
+            if shares_changed is not None and shares_changed > 0:
+                change_type = "增持"
+            elif shares_changed is not None and shares_changed < 0:
+                change_type = "减持"
+            else:
+                change_type = "未知"
+
             trades.append({
                 "name": str(row.get("变动人", "")),
+                "position": str(row.get("董监高职务", "")),
                 "relationship": str(row.get("与董监高关系", "")),
-                "change_type": str(row.get("变动方向", "")),
-                "shares_changed": safe_float(row.get("变动股数")),
+                "change_type": change_type,
+                "shares_changed": shares_changed,
                 "price": safe_float(row.get("成交均价")),
                 "shares_after": safe_float(row.get("变动后持股数")),
                 "date": str(row.get("变动日期", "")),
             })
 
-        buys = [t for t in trades if "增持" in str(t.get("change_type", ""))]
-        sells = [t for t in trades if "减持" in str(t.get("change_type", ""))]
+        buys = [t for t in trades if t["change_type"] == "增持"]
+        sells = [t for t in trades if t["change_type"] == "减持"]
 
         return {
             "symbol": sym,
@@ -326,7 +347,7 @@ def fetch_insider_trades(symbol: str) -> dict:
             "summary": {
                 "total_purchases": len(buys),
                 "total_sales": len(sells),
-                "unique_buyers": len(set(t.get("name", "") for t in buys)),
+                "unique_buyers": len(set(t["name"] for t in buys)),
             },
             "transactions": trades,
         }
